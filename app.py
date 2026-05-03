@@ -185,7 +185,7 @@ def login():
     )
     return jsonify(
         {
-            "access_token": token,
+            "token": token,
             "token_type": "Bearer",
             "expires_at": exp.isoformat(),
         }

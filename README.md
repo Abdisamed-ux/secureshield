@@ -173,3 +173,11 @@ curl -X POST http://localhost:5000/logout \
 3. Change `"role": "user"` → `"role": "admin"` in the payload
 4. Copy the modified token (without re-signing)
 5. Use it in a DELETE request — server returns **401 Invalid token**
+
+## Team Members
+| Name | Student ID |
+|------|-----------|
+| Abdisamed Ahmed Mohamud | 230208709 |
+| Suad Abdırahman | 220208783 |
+| Manar Algburi | 220208935 |
+| Fatima Yusuf | 220208865 |

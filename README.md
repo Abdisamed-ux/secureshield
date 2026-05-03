@@ -1,3 +1,99 @@
+# SecureShield — Mini Project II (RBAC API)
+
+Flask-based secure backend implementing JWT authentication and role-based access control (RBAC).
+
+## Features Implemented
+
+- `POST /register` — register standard users with bcrypt-hashed passwords (SQLite storage).
+- `POST /login` — authenticate and issue JWT (`username`, `role`, `jti`, `exp`).
+- `POST /logout` — revoke active token by blacklisting its `jti`.
+- `GET /profile` — protected route accessible by authenticated `user` and `admin`.
+- `DELETE /user/<id>` — protected admin-only route.
+- Defensive logging: all `403 Forbidden` responses are logged to `security.log`.
+
+## Tech Stack
+
+- Flask
+- Flask-Bcrypt
+- PyJWT
+- SQLite (local file DB)
+
+## Project Files
+
+- `app.py` — main API implementation.
+- `requirements.txt` — dependencies.
+- `REPORT.md` — brief report required by assignment.
+- `security.log` — generated at runtime for forbidden attempts.
+
+## Setup
+
+```bash
+cd /Users/abdismed/secureshield
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+export SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+python app.py
+```
+
+Server runs by default at: `http://127.0.0.1:5000`
+
+## Seed Admin (for demo)
+
+The app seeds an admin account if none exists:
+
+- Username: `admin`
+- Password: `admin123`
+
+Override with env vars before starting:
+
+```bash
+export SEED_ADMIN_USERNAME="your_admin_name"
+export SEED_ADMIN_PASSWORD="your_admin_password"
+```
+
+## Required Demo Flow (for video)
+
+### 1) Successful login
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"admin123"}'
+```
+
+### 2) Access denied (user tries admin route)
+
+Register/login normal user:
+
+```bash
+curl -s -X POST http://127.0.0.1:5000/register \
+  -H "Content-Type: application/json" \
+  -d '{"username":"alice","password":"secret123"}'
+```
+
+Use returned user token for admin delete endpoint:
+
+```bash
+curl -i -X DELETE http://127.0.0.1:5000/user/1 \
+  -H "Authorization: Bearer <USER_TOKEN>"
+```
+
+Expected: `403 Forbidden`
+
+### 3) Tamper test
+
+- Copy a valid token to [jwt.io](https://jwt.io)
+- Manually change `"role": "user"` to `"role": "admin"` without re-signing
+- Send tampered token to `/profile` or `/user/<id>`
+- Expected: invalid token/signature rejection (`401`)
+
+## Security Notes
+
+- Passwords are never stored in plaintext (bcrypt hash only).
+- JWT payload must not store sensitive secrets (passwords, private keys, etc.).
+- Principle of least privilege is enforced through role checks on protected routes.
+
 # SecureShield — RBAC API
 
 A Python Flask application implementing JWT authentication and Role-Based Access Control.

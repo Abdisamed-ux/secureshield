@@ -1,317 +1,237 @@
 """
-SecureShield - Role-Based Access Control (RBAC) API
-Flask application implementing JWT authentication and role-based access control.
+SecureShield — RBAC API (Mini Project II)
+Flask + JWT + bcrypt + SQLite
 """
 
-import jwt
-import json
-import logging
-import sqlite3
 import os
+import sqlite3
+import uuid
 from datetime import datetime, timedelta, timezone
 from functools import wraps
-from flask import Flask, request, jsonify, g
+from pathlib import Path
+
+import jwt
+from flask import Flask, g, jsonify, request
 from flask_bcrypt import Bcrypt
 
-# ─────────────────────────────────────────────
-#  App Configuration
-# ─────────────────────────────────────────────
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "secureshield.db"
+SECURITY_LOG = BASE_DIR / "security.log"
+
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "super-secret-dev-key-change-in-production")
-app.config["JWT_EXPIRY_HOURS"] = 1
+# Use a long random secret in production (env); default is dev-only, 32+ chars for HS256.
+app.config["SECRET_KEY"] = os.environ.get(
+    "SECRET_KEY",
+    "dev-insecure-key-please-set-SECRET_KEY-32chars-min",
+)
+app.config["JWT_EXPIRATION_HOURS"] = int(os.environ.get("JWT_EXPIRATION_HOURS", "24"))
 
 bcrypt = Bcrypt(app)
 
-# ─────────────────────────────────────────────
-#  Task 6: Defensive Logging Setup
-# ─────────────────────────────────────────────
-security_logger = logging.getLogger("security")
-security_logger.setLevel(logging.WARNING)
-file_handler = logging.FileHandler("security.log")
-file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-security_logger.addHandler(file_handler)
+# In-memory JWT blacklist (jti -> revoked)
+_token_blacklist: set[str] = set()
 
-# ─────────────────────────────────────────────
-#  Task 5: In-Memory Token Blacklist
-# ─────────────────────────────────────────────
-token_blacklist: set[str] = set()
-
-# ─────────────────────────────────────────────
-#  Database Setup (SQLite)
-# ─────────────────────────────────────────────
-DATABASE = "users.db"
 
 def get_db():
-    db = sqlite3.connect(DATABASE)
-    db.row_factory = sqlite3.Row
-    return db
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
 
 def init_db():
-    """Create users table and seed a default admin."""
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT    UNIQUE NOT NULL,
-                password TEXT    NOT NULL,
-                role     TEXT    NOT NULL DEFAULT 'user'
-            )
-        """)
-        db.commit()
+    conn = get_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL CHECK(role IN ('user', 'admin'))
+        )
+        """
+    )
+    conn.commit()
 
-        # Seed admin account if not exists
-        existing = db.execute("SELECT id FROM users WHERE username = 'admin'").fetchone()
-        if not existing:
-            hashed = bcrypt.generate_password_hash("admin123").decode("utf-8")
-            db.execute(
-                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                ("admin", hashed, "admin")
-            )
-            db.commit()
-            print("[INIT] Admin account created: admin / admin123")
+    # Seed default admin if none exists (demo / coursework)
+    row = conn.execute("SELECT id FROM users WHERE role = 'admin' LIMIT 1").fetchone()
+    if row is None:
+        admin_user = os.environ.get("SEED_ADMIN_USERNAME", "admin")
+        admin_pass = os.environ.get("SEED_ADMIN_PASSWORD", "admin123")
+        pw_hash = bcrypt.generate_password_hash(admin_pass).decode("utf-8")
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'admin')",
+            (admin_user, pw_hash),
+        )
+        conn.commit()
+    conn.close()
 
 
-init_db()
+def _extract_bearer_token() -> str | None:
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    return auth[7:].strip() or None
 
-# ─────────────────────────────────────────────
-#  Helper: Generate JWT
-# ─────────────────────────────────────────────
-def generate_token(user_id: int, username: str, role: str) -> str:
-    payload = {
-        "sub": user_id,
-        "username": username,
-        "role": role,
-        "exp": datetime.now(timezone.utc) + timedelta(hours=app.config["JWT_EXPIRY_HOURS"]),
-        "iat": datetime.now(timezone.utc),
-    }
-    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
 
-# ─────────────────────────────────────────────
-#  Task 3: JWT Validation Decorator
-# ─────────────────────────────────────────────
-def jwt_required(f):
+def _decode_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(
+            token,
+            app.config["SECRET_KEY"],
+            algorithms=["HS256"],
+        )
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            security_logger.warning(
-                f"MISSING_TOKEN | endpoint={request.path} | ip={request.remote_addr}"
-            )
-            return jsonify({"error": "Authorization header missing or malformed"}), 401
-
-        token = auth_header.split(" ", 1)[1]
-
-        # Task 5: Check blacklist
-        if token in token_blacklist:
-            security_logger.warning(
-                f"REVOKED_TOKEN | endpoint={request.path} | ip={request.remote_addr}"
-            )
-            return jsonify({"error": "Token has been revoked. Please log in again."}), 401
-
-        try:
-            payload = jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
-        except jwt.ExpiredSignatureError:
-            return jsonify({"error": "Token has expired"}), 401
-        except jwt.InvalidTokenError as e:
-            security_logger.warning(
-                f"INVALID_TOKEN | endpoint={request.path} | ip={request.remote_addr} | reason={e}"
-            )
-            return jsonify({"error": "Invalid token"}), 401
-
-        # Store decoded payload + raw token for use in route handlers
-        g.current_user = payload
-        g.raw_token = token
+        token = _extract_bearer_token()
+        if not token:
+            return jsonify({"error": "Missing or invalid Authorization header"}), 401
+        payload = _decode_token(token)
+        if not payload:
+            return jsonify({"error": "Invalid or expired token"}), 401
+        jti = payload.get("jti")
+        if jti and jti in _token_blacklist:
+            return jsonify({"error": "Token has been revoked"}), 401
+        g.jwt_payload = payload
+        g.current_username = payload.get("username")
+        g.current_role = payload.get("role")
         return f(*args, **kwargs)
 
     return decorated
 
-# ─────────────────────────────────────────────
-#  Task 4: Role-Based Access Decorator
-# ─────────────────────────────────────────────
-def role_required(*allowed_roles):
-    def decorator(f):
-        @wraps(f)
-        def decorated(*args, **kwargs):
-            user_role = g.current_user.get("role")
-            if user_role not in allowed_roles:
-                security_logger.warning(
-                    f"FORBIDDEN | user={g.current_user.get('username')} "
-                    f"| role={user_role} | attempted={request.path} "
-                    f"| method={request.method} | ip={request.remote_addr}"
-                )
-                return jsonify({
-                    "error": "Forbidden: insufficient privileges",
-                    "your_role": user_role,
-                    "required_roles": list(allowed_roles),
-                }), 403
-            return f(*args, **kwargs)
-        return decorated
-    return decorator
 
-# ─────────────────────────────────────────────
-#  Task 6: Middleware — log every 403 attempt
-# ─────────────────────────────────────────────
+def admin_required(f):
+    @wraps(f)
+    @token_required
+    def decorated(*args, **kwargs):
+        if (g.current_role or "").lower() != "admin":
+            return jsonify({"error": "Forbidden: admin role required"}), 403
+        return f(*args, **kwargs)
+
+    return decorated
+
+
 @app.after_request
-def log_forbidden(response):
+def log_forbidden_attempts(response):
     if response.status_code == 403:
-        security_logger.warning(
-            f"403_FORBIDDEN_RESPONSE | path={request.path} | method={request.method} "
-            f"| ip={request.remote_addr}"
+        line = (
+            f"{datetime.now(timezone.utc).isoformat()} | "
+            f"{request.method} {request.path} | 403 Forbidden | "
+            f"remote={request.remote_addr}\n"
         )
+        SECURITY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(SECURITY_LOG, "a", encoding="utf-8") as logf:
+            logf.write(line)
     return response
 
-# ─────────────────────────────────────────────
-#  Routes
-# ─────────────────────────────────────────────
 
-@app.route("/")
-def index():
-    return jsonify({
-        "app": "SecureShield RBAC API",
-        "endpoints": {
-            "POST /register": "Register a new user",
-            "POST /login": "Authenticate and receive JWT",
-            "POST /logout": "Revoke current JWT",
-            "GET /profile": "Protected – User & Admin",
-            "DELETE /user/<id>": "Protected – Admin only",
-            "GET /users": "Protected – Admin only, list all users",
-        }
-    })
-
-
-# ──── Task 1: Secure Registration ────
-@app.route("/register", methods=["POST"])
+@app.post("/register")
 def register():
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-    role = data.get("role", "user")
-
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password are required"}), 400
 
-    if role not in ("user", "admin"):
-        return jsonify({"error": "role must be 'user' or 'admin'"}), 400
-
-    # Task 1: bcrypt salt + hash — never store plain text
-    hashed_password = bcrypt.generate_password_hash(password).decode("utf-8")
-
+    pw_hash = bcrypt.generate_password_hash(password).decode("utf-8")
+    conn = get_db()
     try:
-        with get_db() as db:
-            db.execute(
-                "INSERT INTO users (username, password, role) VALUES (?, ?, ?)",
-                (username, hashed_password, role)
-            )
-            db.commit()
+        conn.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?, ?, 'user')",
+            (username, pw_hash),
+        )
+        conn.commit()
     except sqlite3.IntegrityError:
+        conn.close()
         return jsonify({"error": "Username already exists"}), 409
-
-    return jsonify({
-        "message": f"User '{username}' registered successfully",
-        "role": role,
-        "password_storage": "bcrypt hashed (never plain text)"
-    }), 201
+    conn.close()
+    return jsonify({"message": "User registered", "username": username, "role": "user"}), 201
 
 
-# ──── Task 2: Login & JWT Issuance ────
-@app.route("/login", methods=["POST"])
+@app.post("/login")
 def login():
     data = request.get_json(silent=True) or {}
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
-
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
     if not username or not password:
         return jsonify({"error": "username and password are required"}), 400
 
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
-
-    # Constant-time comparison via bcrypt — prevents timing attacks
-    if not user or not bcrypt.check_password_hash(user["password"], password):
-        security_logger.warning(
-            f"FAILED_LOGIN | username={username} | ip={request.remote_addr}"
-        )
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, username, password_hash, role FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+    conn.close()
+    if not row or not bcrypt.check_password_hash(row["password_hash"], password):
         return jsonify({"error": "Invalid credentials"}), 401
 
-    token = generate_token(user["id"], user["username"], user["role"])
-
-    return jsonify({
-        "message": "Login successful",
-        "token": token,
-        "token_type": "Bearer",
-        "expires_in": f"{app.config['JWT_EXPIRY_HOURS']} hour(s)",
-        "username": user["username"],
-        "role": user["role"],
-    }), 200
-
-
-# ──── Task 5: Logout / Token Revocation ────
-@app.route("/logout", methods=["POST"])
-@jwt_required
-def logout():
-    token_blacklist.add(g.raw_token)
-    return jsonify({
-        "message": "Logged out successfully. Token has been revoked.",
-        "blacklisted_tokens": len(token_blacklist),
-    }), 200
-
-
-# ──── Task 4: GET /profile — User & Admin ────
-@app.route("/profile", methods=["GET"])
-@jwt_required
-@role_required("user", "admin")
-def profile():
-    user = g.current_user
-    db = get_db()
-    row = db.execute("SELECT id, username, role FROM users WHERE id = ?", (user["sub"],)).fetchone()
-    return jsonify({
-        "message": "Profile retrieved successfully",
-        "user": {
-            "id": row["id"],
+    jti = str(uuid.uuid4())
+    exp = datetime.now(timezone.utc) + timedelta(hours=app.config["JWT_EXPIRATION_HOURS"])
+    token = jwt.encode(
+        {
             "username": row["username"],
             "role": row["role"],
+            "jti": jti,
+            "exp": exp,
+        },
+        app.config["SECRET_KEY"],
+        algorithm="HS256",
+    )
+    return jsonify(
+        {
+            "access_token": token,
+            "token_type": "Bearer",
+            "expires_at": exp.isoformat(),
         }
-    }), 200
+    )
 
 
-# ──── Task 4: DELETE /user/<id> — Admin Only ────
-@app.route("/user/<int:user_id>", methods=["DELETE"])
-@jwt_required
-@role_required("admin")
-def delete_user(user_id: int):
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
-    if not user:
-        return jsonify({"error": f"User with id={user_id} not found"}), 404
-
-    # Prevent admin from deleting themselves
-    if user_id == g.current_user["sub"]:
-        return jsonify({"error": "Cannot delete your own account"}), 400
-
-    db.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    db.commit()
-
-    return jsonify({
-        "message": f"User '{user['username']}' (id={user_id}) deleted successfully",
-        "deleted_by": g.current_user["username"],
-    }), 200
+@app.post("/logout")
+@token_required
+def logout():
+    jti = g.jwt_payload.get("jti")
+    if jti:
+        _token_blacklist.add(jti)
+    return jsonify({"message": "Logged out; token invalidated"})
 
 
-# ──── Bonus: GET /users — Admin only ────
-@app.route("/users", methods=["GET"])
-@jwt_required
-@role_required("admin")
-def list_users():
-    db = get_db()
-    rows = db.execute("SELECT id, username, role FROM users").fetchall()
-    return jsonify({
-        "users": [dict(r) for r in rows],
-        "total": len(rows),
-    }), 200
+@app.get("/profile")
+@token_required
+def profile():
+    return jsonify(
+        {
+            "username": g.current_username,
+            "role": g.current_role,
+        }
+    )
 
 
-# ─────────────────────────────────────────────
-#  Entry Point
-# ─────────────────────────────────────────────
+@app.delete("/user/<int:user_id>")
+@admin_required
+def delete_user(user_id):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"message": f"User {user_id} deleted"})
+
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
+
+
+with app.app_context():
+    init_db()
+
 if __name__ == "__main__":
-    app.run(debug=True, port=9000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=True)

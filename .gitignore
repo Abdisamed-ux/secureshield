@@ -6,3 +6,4 @@ __pycache__/
 security.log
 token.txt
 .env
+*.docx
